@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import Optional
+import numpy as np
+import scipy as sp
 
 import torch as th
 from simple_parsing import field
@@ -84,6 +86,11 @@ class Train:
 
     loss: LossChoice = LossChoice.KL
     """Loss function to use."""
+    
+    consistency_weight: float = 0.0
+    
+    start_temp: float = 1.0
+    end_temp: float = 1e-8
 
     def get_lens(self, model: PreTrainedModel) -> TunedLens:
         """Load or create a TunedLens model."""
@@ -121,7 +128,7 @@ class Train:
         step: int,
         losses: dict[str, list[float]],
         tuned_lens: TunedLens,
-        nats_to_bpb: float,
+        temperature: float,
     ):
         """Log statistics about the training process to weights and biases."""
         if not self.dist.primary or not self.wandb:
@@ -131,8 +138,9 @@ class Train:
 
         log_dict = {}
         log_dict.update(
-            {f"loss/{k}": th.tensor(v).mean() * nats_to_bpb for k, v in losses.items()}
+            {f"loss/{k}": th.tensor(v).mean() for k, v in losses.items()}
         )
+        log_dict["temperature"] = temperature
 
         # Log statistics about optimizer & probes
         for i, probe in enumerate(tuned_lens):
@@ -160,6 +168,9 @@ class Train:
                 log_dict["bias_norm/" + name] = probe.bias.data.norm()
                 log_dict["weight_norm/" + name] = probe.weight.data.norm()
 
+        log_dict["ln_bias_norm"] = tuned_lens.probs_ln.bias.data.norm()
+        log_dict["ln_weight_norm"] = tuned_lens.probs_ln.weight.data.norm()
+        
         wandb.log(log_dict)
 
     def _save_model(self, tuned_lens: TunedLens, model_name: str):
@@ -299,13 +310,19 @@ class Train:
                 raise NotImplementedError(f"Unknown loss {self.loss}")
 
             labels = shift_labels(labels, shift)
+            
+            # cosine schedule
+            u = batch_idx / total_batches
+            c = 1 - (np.cos(np.pi * u) + 1) / 2
+            reconstruct_temp = self.start_temp + (self.end_temp - self.start_temp) * c
 
             # We do this sequentially to save VRAM
             for i, h in enumerate(hidden_stats):
                 # bfloat16 has larger dynamic range than float16 and seems to be better
                 # for computing log softmax & KL loss
                 with th.autocast(self.dist.device.type, dtype=th.bfloat16):
-                    logits = shift_preds(ddp_lens(h, idx=i), shift)
+                    logits_pre_shift = ddp_lens(h, idx=i)
+                    logits = shift_preds(logits_pre_shift, shift)
 
                     if self.loss == LossChoice.CE:
                         loss = th.nn.functional.cross_entropy(
@@ -317,12 +334,36 @@ class Train:
                         ).mean()
                     else:
                         raise NotImplementedError
-
-                    # Log the loss *before* LASSO regularization
+                    
+                    loss *= nats_to_bpb
                     logging_loss = loss.detach()
                     logging_loss = maybe_all_reduce(logging_loss).item()
+                    
+                    if self.consistency_weight > 0:
+                        probs = th.nn.functional.softmax(logits_pre_shift, dim=-1)
+                        reconstruction = ddp_lens.reconstruct(probs, idx=i)
+                        
+                        # use cosine similiarity as reconstruction loss
+                        reconstruction_loss = 1 - th.nn.functional.cosine_similarity(
+                            h, reconstruction, dim=-1
+                        ).mean()
+                        
+                        logging_reconstruction_loss = reconstruction_loss.detach()
+                        logging_reconstruction_loss = maybe_all_reduce(logging_reconstruction_loss).item()
+                        
+                        loss += self.consistency_weight * reconstruction_loss
+                        
+                        # sparse if p_max > 0.9
+                        p_max = probs.max(dim=-1)[0]
+                        count_sparse = (p_max > 0.9).float().mean().item()
+
                     if self.dist.primary:
-                        losses[f"translator_{i}"].append(logging_loss)
+                        losses[f"loss_{i}"].append(loss.detach().item())
+                        if self.consistency_weight > 0:
+                            losses[f"translator_{i}"].append(logging_loss)
+                            losses[f"reconstruction_{i}"].append(logging_reconstruction_loss)
+                            losses[f"sparsity_{i}"].append(count_sparse)
+                        
 
                     scaled_loss = loss / grad_acc_steps
 
@@ -330,11 +371,12 @@ class Train:
 
             step, rem = divmod(batch_idx, grad_acc_steps)
             if rem == 0:
+                pbar.set_postfix({"reconstruction_5": th.tensor(losses["reconstruction_5"]).mean().item()})
                 th.nn.utils.clip_grad_norm_(lens.parameters(), 1.0)
                 opt.step()
                 opt.zero_grad(set_to_none=False)
                 scheduler.step()
-                self._log(opt, step, losses, lens, nats_to_bpb)
+                self._log(opt, step, losses, lens, reconstruct_temp)
                 losses.clear()
 
         if self.dist.primary:

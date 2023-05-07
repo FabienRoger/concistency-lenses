@@ -45,7 +45,6 @@ class Lens(abc.ABC, th.nn.Module):
         """Decode hidden states into logits."""
         ...
 
-
 class LogitLens(Lens):
     """Unembeds the residual stream into logits."""
 
@@ -133,6 +132,7 @@ class TunedLens(Lens):
     config: TunedLensConfig
     unembed: Unembed
     layer_translators: th.nn.ModuleList
+    probs_ln: th.nn.LayerNorm
 
     def __init__(
         self,
@@ -152,13 +152,17 @@ class TunedLens(Lens):
         config.unemebd_hash = unembed_hash
 
         translator = th.nn.Linear(config.d_model, config.d_model, bias=config.bias)
-        translator.weight.data.zero_()
+        # translator.weight.data.zero_()
+        # identity init
+        translator.weight.data.copy_(th.eye(config.d_model))
         translator.bias.data.zero_()
 
         # Don't include the final layer since it does not need a translator
         self.layer_translators = th.nn.ModuleList(
-            [deepcopy(translator) for _ in range(self.config.num_hidden_layers)]
+            [th.nn.utils.parametrizations.orthogonal(deepcopy(translator)) for _ in range(self.config.num_hidden_layers)]
         )
+        self.vocab_size = unembed.unembedding.weight.shape[0]
+        self.probs_ln = th.nn.LayerNorm(self.vocab_size)
 
     def __getitem__(self, item: int) -> th.nn.Module:
         """Get the probe module at the given index."""
@@ -270,7 +274,8 @@ class TunedLens(Lens):
         # Load parameters
         state = th.load(ckpt_path, **th_load_kwargs)
 
-        lens.layer_translators.load_state_dict(state)
+        lens.layer_translators.load_state_dict(state["translators"])
+        lens.probs_ln.load_state_dict(state["probs_ln"])
 
         return lens
 
@@ -289,7 +294,10 @@ class TunedLens(Lens):
         """
         path = Path(path)
         path.mkdir(exist_ok=True, parents=True)
-        state_dict = self.layer_translators.state_dict()
+        state_dict = {
+            "translators": self.layer_translators.state_dict(),
+            "probs_ln": self.probs_ln.state_dict(),
+        }
 
         th.save(state_dict, path / ckpt)
         with open(path / config, "w") as f:
@@ -300,7 +308,8 @@ class TunedLens(Lens):
         # Note that we add the translator output residually, in contrast to the formula
         # in the paper. By parametrizing it this way we ensure that weight decay
         # regularizes the transform toward the identity, not the zero transformation.
-        return h + self[idx](h)
+        return self[idx](h)
+        # return h + self[idx](h)
 
     def forward(self, h: th.Tensor, idx: int) -> th.Tensor:
         """Transform and then decode the hidden states into logits."""
@@ -310,3 +319,13 @@ class TunedLens(Lens):
     def __len__(self) -> int:
         """Return the number of layer translators in the lens."""
         return len(self.layer_translators)
+    
+    def reconstruct(self, probs: th.Tensor, idx: int) -> th.Tensor:
+        """Reconstruct the hidden states from the logits."""
+        scaled_probs = self.probs_ln(probs)
+        
+        unembed_matrix = self.unembed.unembedding.weight # (vocab_size, d_model)
+        translator_matrix = self.layer_translators[idx].weight # (d_model, d_model)
+        
+        return th.einsum("...v, vd, dh -> ...h", scaled_probs, unembed_matrix, translator_matrix)
+    
