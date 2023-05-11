@@ -86,16 +86,17 @@ class Train:
 
     loss: LossChoice = LossChoice.KL
     """Loss function to use."""
-    
+
     consistency_weight: float = 0.0
-    
+
     start_temp: float = 1.0
-    end_temp: float = 1e-8
+    end_temp: float = 0
+    no_bias: bool = field(action="store_true")
 
     def get_lens(self, model: PreTrainedModel) -> TunedLens:
         """Load or create a TunedLens model."""
         if self.lens_name_or_path is None:
-            lens = TunedLens.from_model(model)
+            lens = TunedLens.from_model(model, bias=not self.no_bias)
         else:
             lens = TunedLens.from_model_and_pretrained(model, self.lens_name_or_path)
 
@@ -137,9 +138,7 @@ class Train:
         import wandb
 
         log_dict = {}
-        log_dict.update(
-            {f"loss/{k}": th.tensor(v).mean() for k, v in losses.items()}
-        )
+        log_dict.update({f"loss/{k}": th.tensor(v).mean() for k, v in losses.items()})
         log_dict["temperature"] = temperature
 
         # Log statistics about optimizer & probes
@@ -165,12 +164,13 @@ class Train:
                 ).norm()
 
             if isinstance(probe, th.nn.Linear):
-                log_dict["bias_norm/" + name] = probe.bias.data.norm()
+                if not self.no_bias:
+                    log_dict["bias_norm/" + name] = probe.bias.data.norm()
                 log_dict["weight_norm/" + name] = probe.weight.data.norm()
 
-        log_dict["ln_bias_norm"] = tuned_lens.probs_ln.bias.data.norm()
-        log_dict["ln_weight_norm"] = tuned_lens.probs_ln.weight.data.norm()
-        
+        for key, weight in tuned_lens.named_parameters():
+            log_dict[f"ln_bias_{key}"] = weight.data.norm()
+
         wandb.log(log_dict)
 
     def _save_model(self, tuned_lens: TunedLens, model_name: str):
@@ -310,10 +310,10 @@ class Train:
                 raise NotImplementedError(f"Unknown loss {self.loss}")
 
             labels = shift_labels(labels, shift)
-            
+
             # cosine schedule
-            u = batch_idx / total_batches
-            c = 1 - (np.cos(np.pi * u) + 1) / 2
+            u = batch_idx / (total_batches - 1)
+            c = 1 - ((np.cos(np.pi * u) + 1) / 2) ** 2
             reconstruct_temp = self.start_temp + (self.end_temp - self.start_temp) * c
 
             # We do this sequentially to save VRAM
@@ -334,25 +334,37 @@ class Train:
                         ).mean()
                     else:
                         raise NotImplementedError
-                    
+
                     loss *= nats_to_bpb
                     logging_loss = loss.detach()
                     logging_loss = maybe_all_reduce(logging_loss).item()
-                    
+
                     if self.consistency_weight > 0:
-                        probs = th.nn.functional.softmax(logits_pre_shift, dim=-1)
+                        if reconstruct_temp < 1e-6:
+                            probs = th.nn.functional.one_hot(
+                                logits.argmax(dim=-1), logits.shape[-1]
+                            )
+                        else:
+                            probs = th.nn.functional.softmax(
+                                logits_pre_shift / reconstruct_temp, dim=-1
+                            )
                         reconstruction = ddp_lens.reconstruct(probs, idx=i)
-                        
+
                         # use cosine similiarity as reconstruction loss
-                        reconstruction_loss = 1 - th.nn.functional.cosine_similarity(
-                            h, reconstruction, dim=-1
-                        ).mean()
-                        
+                        reconstruction_loss = (
+                            1
+                            - th.nn.functional.cosine_similarity(
+                                h, reconstruction, dim=-1
+                            ).mean()
+                        )
+
                         logging_reconstruction_loss = reconstruction_loss.detach()
-                        logging_reconstruction_loss = maybe_all_reduce(logging_reconstruction_loss).item()
-                        
+                        logging_reconstruction_loss = maybe_all_reduce(
+                            logging_reconstruction_loss
+                        ).item()
+
                         loss += self.consistency_weight * reconstruction_loss
-                        
+
                         # sparse if p_max > 0.9
                         p_max = probs.max(dim=-1)[0]
                         count_sparse = (p_max > 0.9).float().mean().item()
@@ -361,9 +373,10 @@ class Train:
                         losses[f"loss_{i}"].append(loss.detach().item())
                         if self.consistency_weight > 0:
                             losses[f"translator_{i}"].append(logging_loss)
-                            losses[f"reconstruction_{i}"].append(logging_reconstruction_loss)
+                            losses[f"reconstruction_{i}"].append(
+                                logging_reconstruction_loss
+                            )
                             losses[f"sparsity_{i}"].append(count_sparse)
-                        
 
                     scaled_loss = loss / grad_acc_steps
 
@@ -371,7 +384,13 @@ class Train:
 
             step, rem = divmod(batch_idx, grad_acc_steps)
             if rem == 0:
-                pbar.set_postfix({"reconstruction_5": th.tensor(losses["reconstruction_5"]).mean().item()})
+                pbar.set_postfix(
+                    {
+                        "reconstruction_5": th.tensor(losses["reconstruction_5"])
+                        .mean()
+                        .item()
+                    }
+                )
                 th.nn.utils.clip_grad_norm_(lens.parameters(), 1.0)
                 opt.step()
                 opt.zero_grad(set_to_none=False)

@@ -45,6 +45,7 @@ class Lens(abc.ABC, th.nn.Module):
         """Decode hidden states into logits."""
         ...
 
+
 class LogitLens(Lens):
     """Unembeds the residual stream into logits."""
 
@@ -126,6 +127,29 @@ class TunedLensConfig:
         return cls(**config_dict)
 
 
+class AddBias(th.nn.Module):
+    """An elementwise affine transformation."""
+
+    def __init__(self, d_model: int):
+        """Create an elementwise affine transformation.
+
+        Args:
+            d_model: The dimensionality of the input.
+            bias: Whether to use a bias.
+        """
+        super().__init__()
+
+        self.bias = th.nn.Parameter(th.zeros(d_model))
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """Apply the affine transformation to the input.
+
+        Args:
+            x: The input to transform.
+        """
+        return x + self.bias
+
+
 class TunedLens(Lens):
     """A tuned lens for decoding hidden states into logits."""
 
@@ -155,14 +179,18 @@ class TunedLens(Lens):
         # translator.weight.data.zero_()
         # identity init
         translator.weight.data.copy_(th.eye(config.d_model))
-        translator.bias.data.zero_()
+        if config.bias:
+            translator.bias.data.zero_()
 
         # Don't include the final layer since it does not need a translator
         self.layer_translators = th.nn.ModuleList(
-            [th.nn.utils.parametrizations.orthogonal(deepcopy(translator)) for _ in range(self.config.num_hidden_layers)]
+            [
+                th.nn.utils.parametrizations.orthogonal(deepcopy(translator))
+                for _ in range(self.config.num_hidden_layers)
+            ]
         )
         self.vocab_size = unembed.unembedding.weight.shape[0]
-        self.probs_ln = th.nn.LayerNorm(self.vocab_size)
+        self.probs_ln = AddBias(self.vocab_size)
 
     def __getitem__(self, item: int) -> th.nn.Module:
         """Get the probe module at the given index."""
@@ -224,9 +252,7 @@ class TunedLens(Lens):
         if lens_resource_id is None:
             lens_resource_id = model.config.name_or_path
 
-        return cls.from_unembed_and_pretrained(
-            Unembed(model), lens_resource_id, **kwargs
-        )
+        return cls.from_unembed_and_pretrained(Unembed(model), lens_resource_id, **kwargs)
 
     @classmethod
     def from_unembed_and_pretrained(
@@ -268,9 +294,7 @@ class TunedLens(Lens):
         # Create the lens
         lens = cls(unembed, config)
 
-        th_load_kwargs = {
-            **{k: v for k, v in kwargs.items() if k not in load_artifact_varnames}
-        }
+        th_load_kwargs = {**{k: v for k, v in kwargs.items() if k not in load_artifact_varnames}}
         # Load parameters
         state = th.load(ckpt_path, **th_load_kwargs)
 
@@ -319,13 +343,12 @@ class TunedLens(Lens):
     def __len__(self) -> int:
         """Return the number of layer translators in the lens."""
         return len(self.layer_translators)
-    
+
     def reconstruct(self, probs: th.Tensor, idx: int) -> th.Tensor:
         """Reconstruct the hidden states from the logits."""
         scaled_probs = self.probs_ln(probs)
-        
-        unembed_matrix = self.unembed.unembedding.weight # (vocab_size, d_model)
-        translator_matrix = self.layer_translators[idx].weight # (d_model, d_model)
-        
+
+        unembed_matrix = self.unembed.unembedding.weight  # (vocab_size, d_model)
+        translator_matrix = self.layer_translators[idx].weight  # (d_model, d_model)
+
         return th.einsum("...v, vd, dh -> ...h", scaled_probs, unembed_matrix, translator_matrix)
-    
