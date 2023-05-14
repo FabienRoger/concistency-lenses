@@ -1,3 +1,4 @@
+import random
 from transformers import AutoTokenizer, AutoModelForCausalLM, GPTNeoXForCausalLM
 import os
 import json
@@ -15,6 +16,7 @@ def run(
     layers: list[int] = [0, 6, 10, 16],
     lr: float = 5e-4,
     max_length: int = 512,
+    generate_every: int = 20,
 ):
     for k, v in locals().items():
         print(f"{k}: {v}")
@@ -48,13 +50,14 @@ def run(
 
     optimizer = torch.optim.Adam(list(decoder_model.parameters()) + adapter_parameters, lr=lr)
     # linear lr warmup
-    warmup_steps = 0.1 * len(all_texts) * n_epochs / batch_size
+    warmup_steps = 0.05 * len(all_texts) * n_epochs / batch_size
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(1, step / warmup_steps))
 
     eos = tokenizer.eos_token
 
-    for epoch in range(n_epochs):
+    for _ in range(n_epochs):
         pbar = trange(0, len(all_texts), batch_size)
+        random.shuffle(all_texts)
 
         for i in pbar:
             batch = all_texts[i : i + batch_size]
@@ -86,44 +89,46 @@ def run(
                 ).to(device)
 
                 def state_insertion_hook(module, inp, out):
-                    out[:, 0, :] = adapters[layer_i](state[: len(out)])
-                    return out
+                    if out.shape[1] > 1:
+                        out[:, 0, :] = adapters[layer_i](state[: len(out), :])
+                        return out
+                    else:
+                        # in generation, we don't inject
+                        return out
 
                 handle = decoder_model.gpt_neox.embed_in.register_forward_hook(state_insertion_hook)
 
                 try:
-                    # generate sequence with injected state of batch elt
-                    with torch.no_grad():
-                        inputs = tokenizer(f"{eos}Layer {layer}\n", return_tensors="pt")
-                        top_generation_tokens = decoder_model.generate(
-                            **inputs.to(device),
-                            do_sample=False,
-                            max_new_tokens=100,
-                            pad_token_id=tokenizer.eos_token_id,
-                        )
-                        top_generation_string = tokenizer.decode(top_generation_tokens[0])
-                        generations.append(top_generation_string)
+                    if i % generate_every == 0:
+                        # generate sequence with injected state of batch elt
+                        with torch.no_grad():
+                            inputs = tokenizer(f"{eos}Layer {layer}\n", return_tensors="pt")
+                            top_generation_tokens = decoder_model.generate(
+                                **inputs.to(device),
+                                do_sample=False,
+                                max_new_tokens=200,
+                                pad_token_id=tokenizer.eos_token_id,
+                            )
+                            top_generation_string = tokenizer.decode(top_generation_tokens[0])
+                            generations.append(top_generation_string)
 
                     # compute logits
-                    logits = (
-                        decoder_model(**expected_tokens, labels=expected_tokens.input_ids)
-                        .logits[:, :-1, :]
-                        .contiguous()
-                    )
+                    logits: torch.Tensor
+                    logits = decoder_model(**expected_tokens, labels=expected_tokens.input_ids).logits[:, :-1, :]
+
+                    labels = expected_tokens.input_ids[:, 1:]
+                    loss_per_pos = torch.nn.functional.cross_entropy(
+                        logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), reduction="none"
+                    ).reshape(labels.shape)
+                    masked_loss = loss_per_pos * expected_tokens.attention_mask[:, :-1]
+                    loss = masked_loss.sum() / expected_tokens.attention_mask[:, :-1].sum()
+
+                    losses.append(loss.item())
+
+                    loss /= len(last_pos_activations)
+                    loss.backward()
                 finally:
                     handle.remove()
-
-                labels = expected_tokens.input_ids[:, 1:].contiguous()
-                loss_per_pos = torch.nn.functional.cross_entropy(
-                    logits.view(-1, logits.shape[-1]), labels.view(-1), reduction="none"
-                ).reshape(labels.shape)
-                masked_loss = loss_per_pos * expected_tokens.attention_mask[:, :-1]
-                loss = masked_loss.sum() / expected_tokens.attention_mask[:, :-1].sum()
-
-                losses.append(loss.item())
-
-                loss /= len(last_pos_activations)
-                loss.backward()
 
             # clip grad
             torch.nn.utils.clip_grad_norm_(decoder_model.parameters(), 1.0)
@@ -134,14 +139,16 @@ def run(
 
             pbar.set_description(f"loss: {sum(losses)/len(losses):.4f}")
 
-            generation_table = wandb.Table(columns=["layer", "generation", "text", "text end", "label"])
-            for layer_i, s in enumerate(generations):
-                generation_table.add_data(layers[layer_i], s, *batch[0])
             to_log = {
                 "loss": sum(losses) / len(losses),
                 **{f"losses/layer_{layers[i]}": loss for i, loss in enumerate(losses)},
-                "generations": generation_table,
+                "lr": scheduler.get_last_lr()[0],
             }
+            if generations:
+                generation_table = wandb.Table(columns=["layer", "generation", "text", "text end", "label"])
+                for layer_i, s in enumerate(generations):
+                    generation_table.add_data(layers[layer_i], s, *batch[0])
+                to_log["generations"] = generation_table
             wandb.log(to_log)
 
     wandb.finish()
