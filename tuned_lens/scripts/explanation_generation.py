@@ -17,20 +17,25 @@ Text summary: <summary of the text, of at most 30 words>
 Probable next sentences: <list of the 3 most likely completions of this text, *each should be exactly 8 words long*: interrupt yourself in the middle of the sentence if you exceed 8 words!! Hint: completions should porbably start with one of the most probable next words>
 1. <first completion>
 2. <second completion>
-3. <third completion>"""
+3. <third completion>
+The prompt of the user will always be of the form
+"<Text that ends with word or punctuation <w>>
+->"
+and you should start immediatly with
+Current word: <w>"""
 
 
 def run(
     pile_path: str = "~/datasets/pile/val.jsonl",
     write_path: str = "data.jsonl",
     model_name: str = "EleutherAI/pythia-70m-deduped",
-    max_samples: int = 5000,
+    max_samples: int = 40000,
     max_length: int = 256,
     additional_tokens_kept: int = 20,
     min_length: int = 20,
-    nb_solutions: int = 2,
+    nb_solutions: int = 1,
     model: str = "gpt-3.5-turbo",
-    temperature: float = 0.7,
+    temperature: float = 0.0,
 ):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     expanded_path = os.path.expanduser(pile_path)
@@ -56,7 +61,7 @@ def run(
         i += 1
 
     prompts = [
-        ((text, e), [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text}])
+        ((text, e), [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text + "\n->"}])
         for text, e in texts
     ]
     results = threaded_generations(prompts, nb_solutions=nb_solutions, model=model, temperature=temperature)

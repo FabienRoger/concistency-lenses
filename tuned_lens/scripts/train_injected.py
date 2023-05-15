@@ -55,7 +55,16 @@ def run(
 
     eos = tokenizer.eos_token
 
-    for _ in range(n_epochs):
+    # dry save to check things work
+    e = 0
+    os.makedirs(f"checkpoints/{wandb.run.id}/epoch_{e}", exist_ok=True)
+    decoder_model.save_pretrained(f"checkpoints/{wandb.run.id}/epoch_{e}")
+    torch.save(
+        {layers[i]: adapter for i, adapter in enumerate(adapters)},
+        f"checkpoints/{wandb.run.id}/epoch_{e}/adapters",
+    )
+
+    for e in range(n_epochs):
         pbar = trange(0, len(all_texts), batch_size)
         random.shuffle(all_texts)
 
@@ -99,7 +108,7 @@ def run(
                 handle = decoder_model.gpt_neox.embed_in.register_forward_hook(state_insertion_hook)
 
                 try:
-                    if i % generate_every == 0:
+                    if (i // batch_size) % generate_every == 0:
                         # generate sequence with injected state of batch elt
                         with torch.no_grad():
                             inputs = tokenizer(f"{eos}Layer {layer}\n", return_tensors="pt")
@@ -150,6 +159,13 @@ def run(
                     generation_table.add_data(layers[layer_i], s, *batch[0])
                 to_log["generations"] = generation_table
             wandb.log(to_log)
+
+        os.makedirs(f"checkpoints/{wandb.run.id}/epoch_{e}", exist_ok=True)
+        decoder_model.save_pretrained(f"checkpoints/{wandb.run.id}/epoch_{e}")
+        torch.save(
+            {layers[i]: adapter for i, adapter in enumerate(adapters)},
+            f"checkpoints/{wandb.run.id}/epoch_{e}/adapters",
+        )
 
     wandb.finish()
 
