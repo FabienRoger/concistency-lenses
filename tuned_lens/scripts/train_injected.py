@@ -10,7 +10,7 @@ from fire import Fire
 
 def run(
     batch_size: int = 32,
-    n_epochs: int = 10,
+    n_epochs: int = 3,
     completions_path: str = "data.jsonl",
     model_name: str = "EleutherAI/pythia-410m-deduped",
     layers: list[int] = [0, 6, 10, 16],

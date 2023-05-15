@@ -1,0 +1,2 @@
+# CUDA_VISIBLE_DEVICES=4 python tuned-lens/tuned_lens/scripts/train_injected.py --lr 4e-5
+CUDA_VISIBLE_DEVICES=5 python tuned-lens/tuned_lens/scripts/train_injected.py --lr 1e-5 --model_name EleutherAI/pythia-1.4b-deduped --batch_size 8 --layers 0,8,16,24
