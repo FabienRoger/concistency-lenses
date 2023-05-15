@@ -64,7 +64,7 @@ def run(
         ((text, e), [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": text + "\n->"}])
         for text, e in texts
     ]
-    results = threaded_generations(prompts, nb_solutions=nb_solutions, model=model, temperature=temperature)
+    results = threaded_generations(prompts, nb_solutions=nb_solutions, model=model, temperature=temperature, n_threads=50)
 
     expanded_write_path = os.path.expanduser(write_path)
     with open(expanded_write_path, "w") as f:
